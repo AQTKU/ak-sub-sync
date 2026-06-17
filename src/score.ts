@@ -25,7 +25,7 @@ export interface ScoreConfig {
 
 export const DEFAULT_SCORE_CONFIG: ScoreConfig = {
   frameRate: 23.976,
-  peakOffsetMs: -50,
+  peakOffsetMs: -100,
   leftBoundMs: -500,
   rightBoundMs: 250,
   immediatelyFollowingFrames: 5,
