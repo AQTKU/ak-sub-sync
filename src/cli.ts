@@ -1,7 +1,7 @@
 import { resolve, dirname, basename, join, extname } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, rmSync, existsSync, renameSync } from 'fs';
 import { tmpdir } from 'os';
-import { collectInputs, getOutputType, expandSrtOutputPaths } from './input.js';
+import { collectInputs, getOutputType, expandSrtOutputPaths, classifyFile, extractChapters } from './input.js';
 import { extractAudio, extractSubtitle, convertToSrt } from './extract.js';
 import { parseSrt, cleanCues } from './srt.js';
 import { computeWaveform } from './waveform.js';
@@ -11,9 +11,12 @@ import {
   searchSegmented, adjustCuesSegmented,
   type SegmentSearchResult,
 } from './search.js';
-import { findSilenceRuns, buildSegments } from './segment.js';
 import {
-  buildCorrector, adjustContent,
+  findSilenceRuns, buildSegments,
+  silenceRunsToSplitPoints, findCueGapSplits, findChapterSplits,
+} from './segment.js';
+import {
+  buildCorrector, adjustContent, fixOverlaps,
   muxToContainer, prepareAdjustedSubtitle,
   type Corrector, type MuxSubtitle,
 } from './remux.js';
@@ -25,12 +28,17 @@ import type { SubtitleCue, SubtitleTrack, OutputType } from './types.js';
 function parseArgs(args: string[]) {
   const positional: string[] = [];
   const flags: Record<string, string> = {};
+  const boolFlags = new Set<string>();
+
+  const BOOL_FLAGS = new Set(['segment-on-chapters']);
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg.startsWith('--')) {
       const name = arg.slice(2);
-      if (i + 1 < args.length) {
+      if (BOOL_FLAGS.has(name)) {
+        boolFlags.add(name);
+      } else if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
         flags[name] = args[++i];
       }
     } else {
@@ -42,7 +50,13 @@ function parseArgs(args: string[]) {
     positional,
     output: flags.output,
     fps: flags.fps ? parseFloat(flags.fps) : undefined,
-    minSilence: flags['min-silence'] ? parseFloat(flags['min-silence']) : 1.5,
+    segmentOnSilence: flags['segment-on-silence'] !== undefined
+      ? parseFloat(flags['segment-on-silence'])
+      : 1.5,
+    segmentOnCueGap: flags['segment-on-cue-gap'] !== undefined
+      ? parseFloat(flags['segment-on-cue-gap'])
+      : 0,
+    segmentOnChapters: boolFlags.has('segment-on-chapters'),
     minSegment: flags['min-segment'] ? parseFloat(flags['min-segment']) : 300,
     svgStart: flags['svg-start'] ? parseFloat(flags['svg-start']) : undefined,
     svgEnd: flags['svg-end'] ? parseFloat(flags['svg-end']) : undefined,
@@ -81,10 +95,14 @@ if (opts.positional.length === 0) {
     --output file.mks        Aligned subtitles only (Matroska container)
     --output file.srt        Write aligned .srt files
 
+  Segmentation:
+    --segment-on-silence <s> Split on silence runs (default: 1.5, 0 to disable)
+    --segment-on-cue-gap <s> Split on subtitle cue gaps (default: 0 = disabled)
+    --segment-on-chapters    Split on chapter boundaries (from ffprobe)
+    --min-segment <sec>      Minimum segment length (default: 300, 0 to disable)
+
   Options:
     --fps <rate>             Video frame rate (default: from video stream)
-    --min-silence <sec>      Minimum silence for segment split (default: 1.5)
-    --min-segment <sec>      Minimum segment length (default: 300)
     --svg-start <sec>        SVG start time in seconds (default: 0)
     --svg-end <sec>          SVG end time in seconds (default: file duration)
     --svg-scale <px/s>       SVG pixels per second (default: 50)
@@ -128,7 +146,16 @@ if (input.video) {
   console.log(`    Video: ${basename(input.video.sourcePath)} (stream ${input.video.streamIndex})`);
 }
 
-console.log(`    Audio: ${basename(input.audio.sourcePath)} (stream ${input.audio.streamIndex}, lang: ${input.audio.language})`);
+if (input.audioTracks.length > 1) {
+  console.log(`    Audio: ${input.audioTracks.length} tracks`);
+  for (const a of input.audioTracks) {
+    const sel = a === input.audio ? ' ← selected' : '';
+    const def = a.defaultTrack ? ' [default]' : '';
+    console.log(`      stream ${a.streamIndex}: ${a.language}${def}${sel}`);
+  }
+} else {
+  console.log(`    Audio: ${basename(input.audio.sourcePath)} (stream ${input.audio.streamIndex}, lang: ${input.audio.language})`);
+}
 console.log(`    FPS: ${fps}${opts.fps ? ' (override)' : ' (detected)'}`);
 console.log(`    Duration: ${(input.duration / 60).toFixed(1)} min`);
 
@@ -188,37 +215,6 @@ console.log('');
 
 // ── Segmentation ──
 
-console.log('  Detecting silence runs...');
-const silenceRuns = findSilenceRuns(displayWaveform, {
-  minSilenceSec: opts.minSilence,
-});
-console.log(`    ${silenceRuns.length} silence runs ≥ ${opts.minSilence}s`);
-
-const segments = buildSegments(silenceRuns, input.duration, {
-  minSilenceSec: opts.minSilence,
-  minSegmentSec: opts.minSegment,
-});
-console.log(`    ${segments.length} segment${segments.length !== 1 ? 's' : ''} (min ${opts.minSegment}s)`);
-for (const seg of segments) {
-  const dur = seg.end - seg.start;
-  console.log(
-    `      [${seg.index}] ${fmtTime(seg.start)} → ${fmtTime(seg.end)}` +
-    ` (${(dur / 60).toFixed(1)} min)`,
-  );
-}
-console.log('');
-
-// ── Per-language alignment ──
-
-interface AlignmentResult {
-  ratio: number;
-  segments: SegmentSearchResult[];
-  isUniform: boolean;
-  uniformOffset?: number;
-  vizCues: SubtitleCue[];
-  scored?: ScoredCue[];
-}
-
 const alignmentResults = new Map<number, AlignmentResult>();
 const tempFiles: string[] = [];
 const srtPathCache = new Map<number, string>();
@@ -242,6 +238,75 @@ function getSrtPath(track: SubtitleTrack): string {
 
   srtPathCache.set(track.id, srtPath);
   return srtPath;
+}
+
+console.log('  Segmentation...');
+const splitPoints: number[] = [];
+
+if (opts.segmentOnSilence > 0) {
+  const silenceRuns = findSilenceRuns(displayWaveform, {
+    minSilenceSec: opts.segmentOnSilence,
+  });
+  console.log(`    Silence: ${silenceRuns.length} runs ≥ ${opts.segmentOnSilence}s`);
+  splitPoints.push(...silenceRunsToSplitPoints(silenceRuns));
+}
+
+if (opts.segmentOnCueGap > 0 && textTracks.length > 0) {
+  const primaryRef = textTracks.find(t => t.id === uniqueRefIds[0])!;
+  const gapSrtPath = getSrtPath(primaryRef);
+  const gapCues = parseSrt(gapSrtPath);
+  const gapSplits = findCueGapSplits(gapCues, opts.segmentOnCueGap);
+  console.log(`    Cue gaps: ${gapSplits.length} gaps ≥ ${opts.segmentOnCueGap}s`);
+  splitPoints.push(...gapSplits);
+}
+
+if (opts.segmentOnChapters) {
+  const containerPaths = [...new Set(
+    inputPaths.filter(p => classifyFile(p) === 'container')
+  )];
+  const allChapters: { start: number; end: number; name: string }[] = [];
+  for (const cp of containerPaths) {
+    allChapters.push(...extractChapters(cp));
+  }
+  const seen = new Set<number>();
+  const uniqueChapters = allChapters.filter(ch => {
+    const key = +ch.start.toFixed(3);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const chapterSplits = findChapterSplits(uniqueChapters);
+  console.log(`    Chapters: ${uniqueChapters.length} found → ${chapterSplits.length} split points`);
+  for (const ch of uniqueChapters) {
+    console.log(`      ${fmtTime(ch.start)} ${ch.name}`);
+  }
+  splitPoints.push(...chapterSplits);
+}
+
+if (splitPoints.length === 0 && opts.segmentOnSilence === 0 && !opts.segmentOnChapters && opts.segmentOnCueGap === 0) {
+  console.log('    All segmentation disabled — single segment');
+}
+
+const segments = buildSegments(splitPoints, input.duration, opts.minSegment);
+console.log(`    ${segments.length} segment${segments.length !== 1 ? 's' : ''}${opts.minSegment > 0 ? ` (min ${opts.minSegment}s)` : ''}`);
+for (const seg of segments) {
+  const dur = seg.end - seg.start;
+  console.log(
+    `      [${seg.index}] ${fmtTime(seg.start)} → ${fmtTime(seg.end)}` +
+    ` (${(dur / 60).toFixed(1)} min)`,
+  );
+}
+console.log('');
+
+// ── Per-language alignment ──
+
+interface AlignmentResult {
+  ratio: number;
+  segments: SegmentSearchResult[];
+  isUniform: boolean;
+  uniformOffset?: number;
+  vizCues: SubtitleCue[];
+  scored?: ScoredCue[];
 }
 
 console.log(`  Aligning subtitles (${uniqueRefIds.length} pass${uniqueRefIds.length !== 1 ? 'es' : ''})...`);
@@ -435,6 +500,7 @@ if (outputType === 'svg') {
     if (corrector) {
       content = adjustContent(content, '.srt', corrector);
     }
+    content = fixOverlaps(content, '.srt');
 
     writeFileSync(srtOutPath, content);
     console.log(`    ${basename(srtOutPath)}`);
@@ -468,6 +534,9 @@ if (outputType === 'svg') {
 
   const includeVideo = outputType === 'mkv' && !!input.video;
   const includeAudio = outputType !== 'mks';
+  const audioSources = includeAudio
+    ? [...new Set(input.audioTracks.map(a => a.sourcePath))]
+    : [];
 
   // Mux to temp path if output would overwrite an input file
   const conflictsInput = inputPaths.includes(outputPath);
@@ -479,7 +548,7 @@ if (outputType === 'svg') {
   muxToContainer({
     outputPath: muxPath,
     videoSource: includeVideo ? input.video!.sourcePath : undefined,
-    audioSource: includeAudio ? input.audio.sourcePath : undefined,
+    audioSources,
     subtitles: muxSubs,
   });
 

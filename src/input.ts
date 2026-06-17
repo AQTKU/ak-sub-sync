@@ -1,7 +1,7 @@
 import { execFileSync } from 'child_process';
 import { extname, basename } from 'path';
 import type {
-  VideoSource, AudioSource, SubtitleTrack, CollectedInput, OutputType,
+  VideoSource, AudioSource, SubtitleTrack, CollectedInput, OutputType, Chapter,
 } from './types.js';
 
 // ── File classification ─────────────────────────────────────
@@ -94,6 +94,7 @@ interface FFProbeStream {
   r_frame_rate?: string;
   avg_frame_rate?: string;
   tags?: { language?: string };
+  disposition?: { default?: number };
 }
 
 function parseFrameRate(rate?: string): number {
@@ -148,6 +149,7 @@ export function probeContainer(path: string): {
         sourcePath: path,
         streamIndex: s.index,
         language: s.tags?.language ?? 'und',
+        defaultTrack: !!(s.disposition?.default),
       });
     }
   }
@@ -206,6 +208,31 @@ export function probeContainer(path: string): {
   }
 
   return { videoTracks, audioTracks, subtitleTracks, duration };
+}
+
+// ── Chapter extraction ──────────────────────────────────────
+
+export function extractChapters(path: string): Chapter[] {
+  try {
+    const probe = execFileSync('ffprobe', [
+      '-v', 'quiet', '-print_format', 'json',
+      '-show_chapters', path,
+    ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
+    const data = JSON.parse(probe);
+
+    const chapters: Chapter[] = [];
+    for (const ch of data.chapters || []) {
+      const endTime = parseFloat(ch.end_time);
+      chapters.push({
+        start: parseFloat(ch.start_time),
+        end: isNaN(endTime) ? Infinity : endTime,
+        name: ch.tags?.title || '',
+      });
+    }
+    return chapters;
+  } catch {
+    return [];
+  }
 }
 
 // ── Standalone subtitle ─────────────────────────────────────
@@ -273,16 +300,23 @@ export function collectInputs(paths: string[]): CollectedInput {
   if (allVideo.length > 1) {
     throw new Error(`Expected 0–1 video tracks, found ${allVideo.length}`);
   }
-  if (allAudio.length !== 1) {
-    throw new Error(`Expected exactly 1 audio track, found ${allAudio.length}`);
+  if (allAudio.length === 0) {
+    throw new Error('No audio tracks found');
   }
   if (allSubs.length === 0) {
     throw new Error('No subtitle tracks found');
   }
 
+  // Select audio: prefer default track, then earliest stream index
+  allAudio.sort((a, b) => {
+    if (a.defaultTrack !== b.defaultTrack) return a.defaultTrack ? -1 : 1;
+    return a.streamIndex - b.streamIndex;
+  });
+
   return {
     video: allVideo[0],
     audio: allAudio[0],
+    audioTracks: allAudio,
     subtitles: allSubs,
     duration,
     fps: allVideo[0]?.fps ?? 23.976,

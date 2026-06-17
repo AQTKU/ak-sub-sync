@@ -48,6 +48,7 @@ export interface AudioSource {
   sourcePath: string;
   streamIndex: number;
   language: string;
+  defaultTrack: boolean;
 }
 
 export interface SubtitleTrack {
@@ -70,9 +71,16 @@ export interface SubtitleTrack {
 export interface CollectedInput {
   video?: VideoSource;
   audio: AudioSource;
+  audioTracks: AudioSource[];
   subtitles: SubtitleTrack[];
   duration: number;
   fps: number;
+}
+
+export interface Chapter {
+  start: number;
+  end: number;
+  name: string;
 }
 
 export type OutputType = 'svg' | 'mkv' | 'mka' | 'mks' | 'srt';

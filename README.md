@@ -10,7 +10,7 @@ Uses [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.
 2. Detects speech regions and speaker turns using pyannote's segmentation model
 3. Segments the file by areas of silence in the audio
 4. Evaluates the fit of subtitles at thousands of frame rate ratios and offsets, scoring alignment based on cue starts weighted by a series of factors (start of a sentence, different speaker, etc.)
-5. Remuxes the MKV with corrected subtitle timestamps, or outputds a standalone SRT
+5. Remuxes the MKV with corrected subtitle timestamps, or outputs a standalone SRT
 
 The scoring function uses an asymmetric proximity window, trying to match most aggressively to perfect cue starts that lead speech by about 50 ms. Earlier cues are found more acceptable than late cues.
 

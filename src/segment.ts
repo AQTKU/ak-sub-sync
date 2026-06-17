@@ -1,21 +1,4 @@
-import type { WaveformData } from './types.js';
-
-// ── Configuration ────────────────────────────────────────────
-
-export interface SegmentConfig {
-  /** Minimum duration of silence to count as a break, in seconds (default: 1.5) */
-  minSilenceSec: number;
-  /** Minimum segment length in seconds (default: 300 = 5 min) */
-  minSegmentSec: number;
-  /** RMS threshold below which audio counts as silent (default: 0.001) */
-  silenceThreshold: number;
-}
-
-export const DEFAULT_SEGMENT_CONFIG: SegmentConfig = {
-  minSilenceSec: 1.5,
-  minSegmentSec: 300,
-  silenceThreshold: 0.001,
-};
+import type { SubtitleCue, WaveformData, Chapter } from './types.js';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -32,27 +15,24 @@ export interface Segment {
 
 // ── Silence detection ────────────────────────────────────────
 
-/**
- * Scan the waveform RMS envelope for sustained runs of silence.
- * Returns runs where every RMS window is below the threshold
- * for at least `minDurationSec` consecutive seconds.
- */
+const DEFAULT_SILENCE_THRESHOLD = 0.001;
+
 export function findSilenceRuns(
   waveform: WaveformData,
-  config?: Partial<SegmentConfig>,
+  config: { minSilenceSec: number; silenceThreshold?: number },
 ): SilenceRun[] {
-  const cfg = { ...DEFAULT_SEGMENT_CONFIG, ...config };
+  const threshold = config.silenceThreshold ?? DEFAULT_SILENCE_THRESHOLD;
   const runs: SilenceRun[] = [];
   let runStartWindow = -1;
 
   for (let w = 0; w < waveform.rms.length; w++) {
-    if (waveform.rms[w] <= cfg.silenceThreshold) {
+    if (waveform.rms[w] <= threshold) {
       if (runStartWindow === -1) runStartWindow = w;
     } else {
       if (runStartWindow !== -1) {
         const startSec = runStartWindow * waveform.windowSize;
         const endSec = w * waveform.windowSize;
-        if (endSec - startSec >= cfg.minSilenceSec) {
+        if (endSec - startSec >= config.minSilenceSec) {
           runs.push({ start: startSec, end: endSec });
         }
         runStartWindow = -1;
@@ -60,11 +40,10 @@ export function findSilenceRuns(
     }
   }
 
-  // Handle silence at end of file
   if (runStartWindow !== -1) {
     const startSec = runStartWindow * waveform.windowSize;
     const endSec = waveform.rms.length * waveform.windowSize;
-    if (endSec - startSec >= cfg.minSilenceSec) {
+    if (endSec - startSec >= config.minSilenceSec) {
       runs.push({ start: startSec, end: endSec });
     }
   }
@@ -72,50 +51,71 @@ export function findSilenceRuns(
   return runs;
 }
 
+// ── Split point sources ──────────────────────────────────────
+
+export function silenceRunsToSplitPoints(runs: SilenceRun[]): number[] {
+  return runs.map(r => (r.start + r.end) / 2);
+}
+
+export function findCueGapSplits(cues: SubtitleCue[], minGapSec: number): number[] {
+  if (cues.length < 2) return [];
+  const sorted = [...cues].sort((a, b) => a.start - b.start);
+  const splits: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i].start - sorted[i - 1].end;
+    if (gap >= minGapSec) {
+      splits.push((sorted[i - 1].end + sorted[i].start) / 2);
+    }
+  }
+  return splits;
+}
+
+export function findChapterSplits(chapters: Chapter[]): number[] {
+  return chapters
+    .map(ch => ch.start)
+    .filter(t => t > 0)
+    .sort((a, b) => a - b);
+}
+
 // ── Segment boundary selection ───────────────────────────────
 
 /**
- * Turn silence runs into segment boundaries.
- *
- * Greedy: walk silence runs left-to-right, placing a split at the
- * midpoint of each run as long as the resulting segment is at least
- * `minSegmentSec` long. If the final segment would be too short,
- * merge it into the previous one.
+ * Build segments from arbitrary split points.
+ * Split points are merged, deduplicated, and filtered by minSegmentSec.
+ * If the final segment would be too short, it's merged into the previous.
  */
 export function buildSegments(
-  silenceRuns: SilenceRun[],
+  splitPoints: number[],
   totalDuration: number,
-  config?: Partial<SegmentConfig>,
+  minSegmentSec: number = 300,
 ): Segment[] {
-  const cfg = { ...DEFAULT_SEGMENT_CONFIG, ...config };
-
-  if (silenceRuns.length === 0) {
+  if (splitPoints.length === 0) {
     return [{ index: 0, start: 0, end: totalDuration }];
   }
 
-  // Collect candidate split points (midpoints of silence runs)
+  const sorted = [...new Set(splitPoints.map(p => +p.toFixed(6)))]
+    .sort((a, b) => a - b);
+
   const boundaries: number[] = [0];
 
-  for (const run of silenceRuns) {
-    const midpoint = (run.start + run.end) / 2;
+  for (const point of sorted) {
+    if (point <= 0 || point >= totalDuration) continue;
     const lastBoundary = boundaries[boundaries.length - 1];
-
-    if (midpoint - lastBoundary >= cfg.minSegmentSec) {
-      boundaries.push(midpoint);
+    if (minSegmentSec > 0 && point - lastBoundary < minSegmentSec) {
+      continue;
     }
+    boundaries.push(point);
   }
 
   boundaries.push(totalDuration);
 
-  // If the last segment is too short, merge it with the previous one
-  if (boundaries.length >= 3) {
+  if (minSegmentSec > 0 && boundaries.length >= 3) {
     const lastLen = boundaries[boundaries.length - 1] - boundaries[boundaries.length - 2];
-    if (lastLen < cfg.minSegmentSec) {
+    if (lastLen < minSegmentSec) {
       boundaries.splice(boundaries.length - 2, 1);
     }
   }
 
-  // Build segment objects
   const segments: Segment[] = [];
   for (let i = 0; i < boundaries.length - 1; i++) {
     segments.push({
