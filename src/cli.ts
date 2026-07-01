@@ -23,6 +23,27 @@ import {
 import type { ScoredCue } from './score.js';
 import type { SubtitleCue, SubtitleTrack, OutputType } from './types.js';
 
+// ── Score colors ─────────────────────────────────────────────
+//
+// Score/min thresholds: <1 abysmal, <3 bad, <4.5 pretty good, <6 good,
+// <10 excellent, >=10 suspiciously excellent.
+const SCORE_COLORS = [
+  { max: 1, code: '\x1b[31m' },    // red — abysmal
+  { max: 3, code: '\x1b[33m' },    // yellow — bad
+  { max: 4.5, code: '\x1b[32m' },  // green — pretty good
+  { max: 6, code: '\x1b[92m' },    // bright green — good
+  { max: 10, code: '\x1b[36m' },   // cyan — excellent
+  { max: Infinity, code: '\x1b[35m' }, // magenta — suspiciously excellent
+];
+const COLOR_RESET = '\x1b[0m';
+const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+
+function colorScore(scorePerMin: number, text: string): string {
+  if (!useColor) return text;
+  const { code } = SCORE_COLORS.find(c => scorePerMin < c.max) ?? SCORE_COLORS[SCORE_COLORS.length - 1];
+  return `${code}${text}${COLOR_RESET}`;
+}
+
 // ── Arg parsing ──────────────────────────────────────────────
 
 function parseArgs(args: string[]) {
@@ -348,7 +369,7 @@ for (let passIdx = 0; passIdx < uniqueRefIds.length; passIdx++) {
         cues, speakerSegments, speakerChanges, searchConfig,
       );
 
-      printSearchResult(search);
+      printSearchResult(search, input.duration);
 
       const isIdentity =
         Math.abs(search.bestRatio - 1.0) < 1e-6 &&
@@ -376,15 +397,19 @@ for (let passIdx = 0; passIdx < uniqueRefIds.length; passIdx++) {
 
       console.log(`    ${search.totalIterations.toLocaleString()} combinations in ${search.elapsedMs.toFixed(0)}ms`);
       console.log(`    Ratio: ${search.ratioLabel} (${search.ratio.toFixed(6)})`);
-      console.log(`    Total score: ${search.totalScore.toFixed(2)}`);
+      const fullDurationMin = input.duration / 60;
+      const totalScorePerMin = search.totalScore / fullDurationMin;
+      console.log(`    Total score: ${colorScore(totalScorePerMin, totalScorePerMin.toFixed(2))}/min`);
 
       if (search.ratioCompetition.length > 1) {
         console.log('    Ratio competition (nearby cluster):');
         for (const rc of search.ratioCompetition) {
           const marker = rc.ratio === search.ratio ? ' ← winner' : '';
+          const rcScorePerMin = rc.totalScore / fullDurationMin;
+          const rcScoreStr = rcScorePerMin.toFixed(2).padStart(8);
           console.log(
             `      ${rc.label.padEnd(14)} ` +
-            `total=${rc.totalScore.toFixed(2).padStart(8)}` +
+            `total=${colorScore(rcScorePerMin, rcScoreStr)}/min` +
             `${marker}`,
           );
         }
@@ -394,10 +419,12 @@ for (let passIdx = 0; passIdx < uniqueRefIds.length; passIdx++) {
       console.log('    Per-segment offsets:');
       for (const sr of search.segments) {
         const sign = sr.bestOffset >= 0 ? '+' : '';
+        const segDurationMin = (sr.segment.end - sr.segment.start) / 60;
+        const segScorePerMin = sr.bestScore / segDurationMin;
         console.log(
           `      [${sr.segment.index}] ` +
           `offset=${sign}${(sr.bestOffset * 1000).toFixed(1)}ms ` +
-          `score=${sr.bestScore.toFixed(2)} ` +
+          `score=${colorScore(segScorePerMin, segScorePerMin.toFixed(2))}/min ` +
           `(${sr.cueCount} cues)`,
         );
       }
@@ -425,8 +452,10 @@ for (let passIdx = 0; passIdx < uniqueRefIds.length; passIdx++) {
     });
 
     const summary = scoreSummary(result.scored);
+    const refDurationMin = input.duration / 60;
     console.log(`    Scoring at best alignment:`);
-    console.log(`      Total weighted score: ${summary.totalWeightedScore.toFixed(2)}`);
+    const weightedScorePerMin = summary.totalWeightedScore / refDurationMin;
+    console.log(`      Total weighted score: ${colorScore(weightedScorePerMin, weightedScorePerMin.toFixed(2))}/min`);
     console.log(`      Mean raw score:       ${summary.meanRawScore.toFixed(3)}`);
     console.log(`      Tiers: spk=${summary.tierCounts.spk} new=${summary.tierCounts.new} gap=${summary.tierCounts.gap} mid=${summary.tierCounts.mid}`);
   }
@@ -642,21 +671,25 @@ function selectAlignmentRef(
   return track;
 }
 
-function printSearchResult(search: ReturnType<typeof searchBestAlignment>) {
+function printSearchResult(search: ReturnType<typeof searchBestAlignment>, durationSec: number) {
   const bestLabel = describeRatio(search.bestRatio);
   const offsetSign = search.bestOffset >= 0 ? '+' : '';
+  const durationMin = durationSec / 60;
   console.log(`    ${search.totalIterations.toLocaleString()} combinations in ${search.elapsedMs.toFixed(0)}ms`);
   console.log(`    Best ratio:  ${bestLabel} (${search.bestRatio.toFixed(6)})`);
   console.log(`    Best offset: ${offsetSign}${(search.bestOffset * 1000).toFixed(1)}ms`);
-  console.log(`    Best score:  ${search.bestScore.toFixed(2)}`);
+  const bestScorePerMin = search.bestScore / durationMin;
+  console.log(`    Best score:  ${colorScore(bestScorePerMin, bestScorePerMin.toFixed(2))}/min`);
 
   console.log('    Top 5 ratios:');
   for (const r of search.ratioResults.slice(0, 5)) {
     const sign = r.bestOffset >= 0 ? '+' : '';
     const marker = r.ratio === search.bestRatio ? ' ← winner' : '';
+    const rScorePerMin = r.bestScore / durationMin;
+    const rScoreStr = rScorePerMin.toFixed(2).padStart(8);
     console.log(
       `      ${r.label.padEnd(14)} ` +
-      `score=${r.bestScore.toFixed(2).padStart(8)} ` +
+      `score=${colorScore(rScorePerMin, rScoreStr)}/min ` +
       `offset=${sign}${(r.bestOffset * 1000).toFixed(1)}ms` +
       `${marker}`,
     );
