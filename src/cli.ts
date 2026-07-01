@@ -1,5 +1,5 @@
 import { resolve, dirname, basename, join, extname } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, rmSync, existsSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, rmSync, existsSync, renameSync, copyFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { collectInputs, getOutputType, expandSrtOutputPaths, classifyFile, extractChapters } from './input.js';
 import { extractAudio, extractSubtitle, convertToSrt } from './extract.js';
@@ -586,8 +586,8 @@ if (outputType === 'svg') {
     mkdirSync(unsyncedDir, { recursive: true });
     const backupPath = join(unsyncedDir, basename(outputPath));
     if (existsSync(backupPath)) unlinkSync(backupPath);
-    renameSync(outputPath, backupPath);
-    renameSync(muxPath, outputPath);
+    moveFileSync(outputPath, backupPath);
+    moveFileSync(muxPath, outputPath);
     console.log(`    Backup: ${backupPath}`);
   }
 
@@ -705,4 +705,14 @@ function fmtTime(sec: number): string {
 
 function fmtRange(start: number, end: number): string {
   return `${fmtTime(start)} → ${fmtTime(end)}`;
+}
+
+function moveFileSync(src: string, dest: string): void {
+  try {
+    renameSync(src, dest);
+  } catch (err: any) {
+    if (err.code !== 'EXDEV') throw err;
+    copyFileSync(src, dest);
+    unlinkSync(src);
+  }
 }
