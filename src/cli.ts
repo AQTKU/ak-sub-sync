@@ -78,6 +78,7 @@ function parseArgs(args: string[]) {
       ? parseFloat(flags['segment-on-cue-gap'])
       : 0,
     segmentOnChapters: boolFlags.has('segment-on-chapters'),
+    noCentreChannel: boolFlags.has('no-centre-channel'),
     minSegment: flags['min-segment'] ? parseFloat(flags['min-segment']) : 300,
     svgStart: flags['svg-start'] ? parseFloat(flags['svg-start']) : undefined,
     svgEnd: flags['svg-end'] ? parseFloat(flags['svg-end']) : undefined,
@@ -214,8 +215,12 @@ const uniqueRefIds = [...new Set([...trackAlignmentRef.values()].map(t => t.id))
 
 // ── Step 1: Extract audio ──
 
-console.log('  [1/3] Extracting audio → waveform...');
-const pcmPath = extractAudio(input.audio.sourcePath, input.audio.streamIndex);
+const useCentre = !opts.noCentreChannel && input.audio.channels > 2;
+console.log(`  [1/3] Extracting audio → waveform...${useCentre ? ' (centre channel only)' : ''}`);
+const pcmPath = extractAudio(input.audio.sourcePath, input.audio.streamIndex, {
+  channels: input.audio.channels,
+  centreChannelOnly: !opts.noCentreChannel,
+});
 
 // ── Step 2: Compute waveform ──
 

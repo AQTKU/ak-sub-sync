@@ -52,8 +52,12 @@ export function extractInfo(inputPath: string): FileInfo {
 }
 
 interface ExtractAudioOptions {
-  /** Bandpass filter to speech frequencies (300Hz–3kHz). Kills music/ambience. */
+  /** Bandpass filter to speech frequencies (300Hz-3kHz). Kills music/ambience. */
   speechFilter?: boolean;
+  /** Number of channels in the source stream. Used to decide centre-channel extraction. */
+  channels?: number;
+  /** Extract only front-centre channel from surround audio. Default: true. */
+  centreChannelOnly?: boolean;
 }
 
 export function extractAudio(
@@ -64,9 +68,14 @@ export function extractAudio(
   const tag = opts?.speechFilter ? 'filtered' : 'full';
   const outPath = join(tmpdir(), `ak-sync-${tag}-${Date.now()}.pcm`);
 
-  const af = opts?.speechFilter
-    ? ['-af', 'highpass=f=300,lowpass=f=3000']
-    : [];
+  const channels = opts?.channels ?? 2;
+  const useCentre = (opts?.centreChannelOnly ?? true) && channels > 2;
+
+  const filters: string[] = [];
+  if (useCentre) filters.push('pan=mono|c0=FC');
+  if (opts?.speechFilter) filters.push('highpass=f=300,lowpass=f=3000');
+
+  const af = filters.length > 0 ? ['-af', filters.join(',')] : [];
 
   execFileSync('ffmpeg', [
     '-y', '-hide_banner', '-loglevel', 'error',

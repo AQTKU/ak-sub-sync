@@ -48,6 +48,7 @@ export interface AudioSource {
   sourcePath: string;
   streamIndex: number;
   language: string;
+  channels: number;
   defaultTrack: boolean;
 }
 

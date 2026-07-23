@@ -91,6 +91,7 @@ interface FFProbeStream {
   index: number;
   codec_type: string;
   codec_name: string;
+  channels?: number;
   r_frame_rate?: string;
   avg_frame_rate?: string;
   tags?: { language?: string };
@@ -149,6 +150,7 @@ export function probeContainer(path: string): {
         sourcePath: path,
         streamIndex: s.index,
         language: s.tags?.language ?? 'und',
+        channels: s.channels ?? 2,
         defaultTrack: !!(s.disposition?.default),
       });
     }
